@@ -16,6 +16,8 @@ import type { CctpTransfer } from '@prisma/client';
 import type { NetworkType } from '@normalfinance/utils';
 
 import { prisma } from '@/lib/prisma';
+import { autofinishDecision } from '@/lib/cctp/autofinish';
+import { parseFailedTool } from '@/lib/cctp/failure-class';
 import { lifiSourceVerdict } from '@/lib/cctp/lifi-verdict';
 
 import { IrisClient } from './iris';
@@ -76,6 +78,56 @@ export async function advanceTransfer(transfer: CctpTransfer): Promise<CctpTrans
                   : 'Source transaction reverted on-chain — funds never left the sender; nothing was bridged',
             },
           });
+          break;
+        }
+
+        // Closed-tab finish (2026-09-02, proved live the same day): the source
+        // leg SUCCEEDED — USDC is sitting at the user's own Base address — but
+        // the burn was historically fired only by the browser tab, so a closed
+        // tab parked the transfer here until a banner tap. The cron now runs
+        // the same shared core the autopilot burn route uses, gated so it never
+        // races a live session and never surprise-fires an old row.
+        if (vd?.status === 'DONE') {
+          const decision = autofinishDecision({
+            ageMs: Date.now() - transfer.createdAt.getTime(),
+            retryCount: transfer.retryCount,
+          });
+          if (!decision.attempt) break;
+
+          // Claim by CAS on retryCount — two overlapping advance passes (a
+          // scheduled cron + a manual poke) increment it once between them;
+          // the loser matches 0 rows and walks away. The increment doubles as
+          // the attempt counter the gate above caps.
+          const claimed = await prisma.cctpTransfer.updateMany({
+            where: {
+              id: transfer.id,
+              status: 'CREATED',
+              burnTxHash: null,
+              retryCount: transfer.retryCount,
+            },
+            data: { retryCount: { increment: 1 } },
+          });
+          if (claimed.count === 0) break;
+
+          // Lazy import: the finisher drags the Turnkey SDK with it, which has
+          // no business loading for the 99% of advance passes that skip this.
+          const { finishInboundBurn } = await import('@/server/autopilot-inbound');
+          const result = await finishInboundBurn(transfer);
+          if (!result.ok) {
+            // Status stays CREATED — the banner path is untouched, and the
+            // next tick retries until the gate's attempt cap. A non-autopilot
+            // user lands here every time (their burn needs their passkey).
+            await prisma.cctpTransfer.updateMany({
+              where: { id: transfer.id, status: 'CREATED' },
+              data: {
+                errorDetail:
+                  `autofinish ${result.reason}${result.detail ? `: ${result.detail}` : ''}`.slice(
+                    0,
+                    500
+                  ),
+              },
+            });
+          }
         }
         break;
       }
@@ -217,10 +269,85 @@ export async function advanceTransfer(transfer: CctpTransfer): Promise<CctpTrans
 // the row's label lies, and it takes two independent failures to get there.
 const STALE_CREATED_MS = 60 * 60_000;
 
+// Outbound rows are COMPLETED *bridge-side* the moment the Base mint confirms,
+// so PENDING_STATUSES never sees them — yet the LI.FI pivot that delivers the
+// asset the user actually asked for may still be unrun. That is the banner's
+// 'halt-finish', and until 2026-09-07 only a browser tab or a manual tap could
+// clear it: one real row sat there for 12 days. This sweep is the outbound twin
+// of the inbound finish in advanceTransfer's CREATED case.
+const STALLED_PIVOT_TAKE = 5;
+
+async function finishStalledPivots(): Promise<number> {
+  const rows = await prisma.cctpTransfer.findMany({
+    where: {
+      direction: 'stellar_to_crosschain',
+      dstSwapTxHash: null,
+      burnTxHash: { not: null },
+      mintTxHash: { not: null },
+      status: { notIn: ['FAILED', 'REFUNDED'] },
+    },
+    orderBy: { createdAt: 'desc' },
+    take: STALLED_PIVOT_TAKE,
+  });
+
+  let finished = 0;
+  for (const tr of rows) {
+    // IDLE time, not age-since-creation. An outbound row is written throughout
+    // its bridge phase (burn hash, status flips, mint hash), so "nothing has
+    // touched this for 10 minutes" is the real abandonment signal. Age-since-
+    // creation would be useless here: the attestation alone takes ~20 minutes,
+    // so every row would qualify the instant its mint landed and the cron would
+    // race the live tab that is about to pivot one second later.
+    const decision = autofinishDecision({
+      ageMs: Date.now() - tr.updatedAt.getTime(),
+      retryCount: tr.retryCount,
+    });
+    if (!decision.attempt) continue;
+
+    // Claim by CAS on retryCount — same contract as the inbound finish: two
+    // overlapping passes increment once between them and the loser walks away,
+    // while the increment doubles as the attempt counter the gate caps.
+    const claimed = await prisma.cctpTransfer.updateMany({
+      where: { id: tr.id, dstSwapTxHash: null, retryCount: tr.retryCount },
+      data: { retryCount: { increment: 1 } },
+    });
+    if (claimed.count === 0) continue;
+
+    // Lazy import: the finisher drags the Turnkey SDK with it, which has no
+    // business loading on the ticks that sweep nothing.
+    const { finishOutboundPivot } = await import('@/server/autopilot-outbound');
+    // Exclude a bridge that already reverted for THIS row, exactly as the
+    // banner's retry does — otherwise the cron re-runs the same failing route
+    // until the attempt cap and wastes gas on every try.
+    const denyBridges = [parseFailedTool(tr.errorDetail)].filter((x): x is string => !!x);
+    const res = await finishOutboundPivot(tr, { denyBridges });
+    if (res.ok) {
+      finished += 1;
+    } else if (!res.revert && (!tr.errorDetail || tr.errorDetail.startsWith('autofinish'))) {
+      // Record why, but NEVER over a revert detail: the banner's retry parses
+      // the failed tool back out of errorDetail, and clobbering it would lose
+      // the failover hint.
+      await prisma.cctpTransfer
+        .updateMany({
+          where: { id: tr.id, dstSwapTxHash: null },
+          data: {
+            errorDetail: `autofinish ${res.reason}${res.detail ? `: ${res.detail}` : ''}`.slice(
+              0,
+              500
+            ),
+          },
+        })
+        .catch(() => {});
+    }
+  }
+  return finished;
+}
+
 /** Advance every in-flight transfer (cron entrypoint). */
 export async function advancePendingTransfers(): Promise<{
   advanced: number;
   byStatus: Record<string, number>;
+  pivotsFinished: number;
 }> {
   await prisma.cctpTransfer.updateMany({
     where: {
@@ -280,5 +407,10 @@ export async function advancePendingTransfers(): Promise<{
     const after = await advanceTransfer(t);
     byStatus[after.status] = (byStatus[after.status] ?? 0) + 1;
   }
-  return { advanced: pending.length, byStatus };
+
+  // Last, so a mint that landed earlier in THIS pass is already visible: the
+  // outbound pivot sweep reads mintTxHash written moments ago.
+  const pivotsFinished = await finishStalledPivots();
+
+  return { advanced: pending.length, byStatus, pivotsFinished };
 }
