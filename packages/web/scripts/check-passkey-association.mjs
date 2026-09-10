@@ -153,9 +153,12 @@ checkAasa(parseJson(AASA_PATH, 'apple-app-site-association'));
 checkAssetlinks(parseJson(ASSETLINKS_PATH, 'assetlinks.json'));
 if (process.argv.includes('--live')) await checkLive();
 
-if (problems.length) {
-  console.error(`\n${problems.length} problem(s):`);
-  for (const p of problems) console.error(`  - ${p}`);
+// --live validates the deployed copies with the same rules, so an unfilled
+// placeholder shows up once locally and once live; report each problem once.
+const unique = [...new Set(problems)];
+if (unique.length) {
+  console.error(`\n${unique.length} problem(s):`);
+  for (const p of unique) console.error(`  - ${p}`);
   console.error(
     '\nUntil these pass, the mobile app cannot use normalfinance.io passkeys: iOS/Android will report "no passkey available" with no pointer to this file.'
   );

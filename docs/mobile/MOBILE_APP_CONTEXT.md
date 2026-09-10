@@ -21,7 +21,7 @@ self-custodial Turnkey wallet secured by a passkey, and can:
 - **Referrals**, activity feed, portfolio.
 
 Web app: Next.js (App Router) on Vercel, MUI + Emotion UI, zustand state, Prisma/Postgres,
-Supabase Auth, PostHog. Production: `normalfinance.io`. Staging: Vercel preview on a
+Supabase Auth. (PostHog is declared in env but NOT wired anywhere in code.) Production: `normalfinance.io`. Staging: Vercel preview on a
 `*.normalfinance.io` subdomain. Repo is a yarn monorepo: `packages/web` (the app),
 `packages/state|utils|types|contracts|goldsky`.
 
@@ -140,15 +140,20 @@ any row needing a signature.
 - **MoneyGram SEP-24** opens a browser flow → needs in-app browser + deep-link return.
 - **Window events** (`nf:cctp-resume`, `nf:session-expired`, etc.) and `localStorage`
   caches in ~12 engine/lib files → replace with an event emitter + AsyncStorage/SecureStore.
-- PostHog web SDK → PostHog RN.
+- Analytics: PostHog is not actually integrated on web (dead env vars only); pick the mobile
+  analytics stack fresh.
 
 ## 7. Environments and credentials
 
-| Env | Backend | rpId | Whose passkeys work |
+| Env | Backend (API base URL) | rpId | Whose passkeys work |
 |---|---|---|---|
-| localhost web | `http://localhost:3000` | `localhost` | only in a browser on localhost — **never in the app** |
-| staging | staging Vercel URL | `normalfinance.io` | any account created on staging/prod web or in the app |
-| production | `https://normalfinance.io` | `normalfinance.io` | same as staging |
+| localhost web | `http://localhost:8082` | `localhost` | only in a browser on localhost — **never in the app** |
+| staging (develop branch) | `https://staging.normalfinance.io` | `normalfinance.io` | any account created on staging/prod web or in the app |
+| production (master) | `https://www.normalfinance.io` | `normalfinance.io` | same as staging |
+
+Mobile `EXPO_PUBLIC_API_BASE_URL` = the staging URL during development, the www URL in
+production builds. The bare `normalfinance.io` redirects to www for everything except
+`/.well-known/*` (association files, live since 2026-09-10).
 
 Supabase Auth project is shared by localhost/staging/prod (one identity per email).
 Mobile development targets **staging**, with a staging account. Passkeys must live in a
@@ -175,12 +180,14 @@ or simply create a fresh account from the app.
 
 - Association files are prepared in the web repo (`packages/web/public/.well-known/
   apple-app-site-association` + `assetlinks.json`, validator
-  `scripts/check-passkey-association.mjs`) with PLACEHOLDERS: Apple Team ID and the Android
-  cert SHA-256 must be filled before deploy.
-- **Apex redirect blocker**: today `https://normalfinance.io/*` 307-redirects to `www.` at the
-  Vercel domain level. Apple and Google refuse redirects on the association files, so the
-  apex must be switched to "serve" in Vercel; `next.config.mjs` now carries the www
-  canonicalization with `/.well-known/*` exempt.
+  `scripts/check-passkey-association.mjs`). Apple Team ID `FA938A596N` (Normal Finance, Inc.)
+  is filled in; the Android cert SHA-256 is still the all-zero placeholder until
+  `eas credentials -p android` produces the keystore.
+- **Apex redirect: RESOLVED 2026-09-10.** The apex now serves the production deployment in
+  Vercel; `next.config.mjs` redirects apex→www for everything except `/.well-known/*`.
+  Verified live: `https://normalfinance.io/.well-known/apple-app-site-association` → 200 JSON,
+  `https://normalfinance.io/savings` → 307 to www. Re-check any time with
+  `node packages/web/scripts/check-passkey-association.mjs --live`.
 - Bundle identifiers chosen: iOS `io.normalfinance.app` (prod) and `io.normalfinance.app.dev`
   (dev/staging builds); Android package `io.normalfinance.app`. Change in both the app
   config and the association files together if renamed.
