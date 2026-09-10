@@ -66,6 +66,19 @@ const nextConfig = {
   },
   async redirects() {
     return [
+      // Apex → www canonicalization, done HERE instead of in Vercel's domain
+      // settings, because Apple and Google fetch the passkey association files
+      // from the bare rpId domain (https://normalfinance.io/.well-known/…) and
+      // refuse any redirect. Vercel's domain-level redirect cannot exempt a
+      // path; this rule can. Inert while Vercel still redirects the apex
+      // itself (those requests never reach Next); becomes THE redirect once
+      // the apex is switched to "serve" in the Vercel dashboard.
+      {
+        source: '/:path((?!\\.well-known(?:/|$)).*)',
+        has: [{ type: 'host', value: 'normalfinance.io' }],
+        destination: 'https://www.normalfinance.io/:path',
+        permanent: false,
+      },
       {
         source: '/invest',
         destination: '/swap',
@@ -85,6 +98,19 @@ const nextConfig = {
   },
   async headers() {
     return [
+      // Native passkeys (mobile app): iOS fetches this file to learn which apps
+      // may use `normalfinance.io` passkeys. It has no extension, so Next would
+      // serve it as application/octet-stream; Apple wants JSON. The Android
+      // counterpart (assetlinks.json) already carries .json. Both live in
+      // public/.well-known/ and are validated by
+      // scripts/check-passkey-association.mjs.
+      {
+        source: '/.well-known/apple-app-site-association',
+        headers: [
+          { key: 'Content-Type', value: 'application/json' },
+          { key: 'Cache-Control', value: 'public, max-age=3600' },
+        ],
+      },
       {
         source: '/api/:path*',
         headers: [
