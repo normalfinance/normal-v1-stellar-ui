@@ -21,7 +21,7 @@ self-custodial Turnkey wallet secured by a passkey, and can:
 - **Referrals**, activity feed, portfolio.
 
 Web app: Next.js (App Router) on Vercel, MUI + Emotion UI, zustand state, Prisma/Postgres,
-Supabase Auth, PostHog. Production: `normalfinance.io`. Staging: Vercel preview on a
+Supabase Auth. (PostHog is declared in env but NOT wired anywhere in code.) Production: `normalfinance.io`. Staging: Vercel preview on a
 `*.normalfinance.io` subdomain. Repo is a yarn monorepo: `packages/web` (the app),
 `packages/state|utils|types|contracts|goldsky`.
 
@@ -140,7 +140,8 @@ any row needing a signature.
 - **MoneyGram SEP-24** opens a browser flow → needs in-app browser + deep-link return.
 - **Window events** (`nf:cctp-resume`, `nf:session-expired`, etc.) and `localStorage`
   caches in ~12 engine/lib files → replace with an event emitter + AsyncStorage/SecureStore.
-- PostHog web SDK → PostHog RN.
+- Analytics: PostHog is not actually integrated on web (dead env vars only); pick the mobile
+  analytics stack fresh.
 
 ## 7. Environments and credentials
 
@@ -179,8 +180,9 @@ or simply create a fresh account from the app.
 
 - Association files are prepared in the web repo (`packages/web/public/.well-known/
   apple-app-site-association` + `assetlinks.json`, validator
-  `scripts/check-passkey-association.mjs`) with PLACEHOLDERS: Apple Team ID and the Android
-  cert SHA-256 must be filled before deploy.
+  `scripts/check-passkey-association.mjs`). Apple Team ID `FA938A596N` (Normal Finance, Inc.)
+  is filled in; the Android cert SHA-256 is still the all-zero placeholder until
+  `eas credentials -p android` produces the keystore.
 - **Apex redirect: RESOLVED 2026-09-10.** The apex now serves the production deployment in
   Vercel; `next.config.mjs` redirects apex→www for everything except `/.well-known/*`.
   Verified live: `https://normalfinance.io/.well-known/apple-app-site-association` → 200 JSON,
